@@ -10,6 +10,11 @@
 // category (computed from this same snapshot), then adjusted by four small
 // factors the snapshot itself supplies: 7-day TVL momentum, years running
 // without a token, chain breadth, and a size dampener for billion-dollar TVLs.
+// Each candidate also carries launch odds — its category's launch base rate
+// in this same snapshot, shrunk toward the market rate — and an expected
+// value (implied × odds). Finally, the model grades itself out-of-sample:
+// every traded protocol is predicted once by tables fitted without it, and
+// those scores are published in the radar's evidence block.
 
 export interface Protocol {
   slug: string;
@@ -58,8 +63,31 @@ export interface RadarRow extends Row {
   multiple: number;
   multiple_n: number;
   factors: Factors;
+  odds: number;
+  odds_rate: number;
+  odds_n: number;
+  odds_launched: number;
+  expected_value_usd: number;
   farm_cost: string;
   farm_time: string;
+}
+
+/**
+ * The model grading itself, computed from the snapshot at run time: every
+ * protocol that already trades a token is predicted once by a model fitted
+ * without it (two slug-hash halves, both directions), so these numbers are
+ * out-of-sample by construction — see heldOutEvidence.
+ */
+export interface Evidence {
+  value_tested: number;
+  value_median_factor: number;
+  value_within_2x: number;
+  value_within_3x: number;
+  value_spearman: number;
+  odds_tested: number;
+  odds_brier_model: number;
+  odds_brier_naive: number;
+  odds_brier_gain: number;
 }
 
 export interface Radar {
@@ -75,8 +103,10 @@ export interface Radar {
     watchlist: number;
     total_implied_usd: number;
     global_multiple: number;
+    global_launch_rate: number;
   };
   multiples: { category: string; n: number; multiple: number }[];
+  evidence: Evidence;
   rows: RadarRow[];
 }
 
@@ -342,6 +372,163 @@ export function farmMeta(p: Protocol): { cost: string; time: string } {
 }
 
 // ---------------------------------------------------------------------------
+// Launch odds. The board answers two questions, not one: what would a launch
+// be worth (the implied value above), and how likely is a launch at all.
+// The odds are a base rate, computed only from this snapshot: among the
+// independent protocols in a category — the ones that already trade a token
+// plus the candidates on this board — the share that has launched. Each
+// category's raw share is shrunk toward the market-wide share with the same
+// n/(n+4) weight the value model uses, so a category with two protocols
+// cannot claim certainty the market does not support. Wrapped, staked and
+// versioned products are excluded from the population on both sides: they
+// are not independent protocols waiting on a launch of their own.
+// ---------------------------------------------------------------------------
+
+export interface OddsTable {
+  global: number;
+  byCategory: Map<string, { n: number; launched: number; rate: number; odds: number }>;
+}
+
+export function launchOddsTable(population: Protocol[]): OddsTable {
+  const counts = new Map<string, { n: number; launched: number }>();
+  let n = 0;
+  let launched = 0;
+  for (const p of population) {
+    const key = p.category ?? 'Uncategorized';
+    const c = counts.get(key) ?? { n: 0, launched: 0 };
+    c.n += 1;
+    n += 1;
+    if (!recordsNoToken(p)) {
+      c.launched += 1;
+      launched += 1;
+    }
+    counts.set(key, c);
+  }
+  const global = n === 0 ? 0 : launched / n;
+  const byCategory = new Map<string, { n: number; launched: number; rate: number; odds: number }>();
+  for (const [key, c] of counts) {
+    const rate = c.n === 0 ? global : c.launched / c.n;
+    const w = c.n / (c.n + 4);
+    byCategory.set(key, { n: c.n, launched: c.launched, rate, odds: w * rate + (1 - w) * global });
+  }
+  return { global, byCategory };
+}
+
+export function oddsFor(table: OddsTable, category: string | null): { n: number; launched: number; rate: number; odds: number } {
+  const hit = table.byCategory.get(category ?? 'Uncategorized');
+  return hit ?? { n: 0, launched: 0, rate: table.global, odds: table.global };
+}
+
+// ---------------------------------------------------------------------------
+// Held-out evidence. Claims about a model are cheap; this board publishes
+// its own out-of-sample scores, computed at run time from the snapshot it
+// was fed. Protocols are split into two halves by a stable hash of the slug
+// (FNV-1a, parity). Each half is then predicted by tables fitted on the
+// other half only, so every scored protocol was held out from its own fit —
+// the value multiples are graded on market caps they never saw, and the
+// launch odds on launch outcomes they never saw (Brier score, against the
+// naive strategy of quoting the market-wide rate for everyone).
+// ---------------------------------------------------------------------------
+
+function slugFold(slug: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < slug.length; i += 1) {
+    h ^= slug.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) % 2;
+}
+
+const roundTo = (x: number, dp: number): number => {
+  const f = 10 ** dp;
+  return Math.round(x * f) / f;
+};
+
+export function heldOutEvidence(protocols: Protocol[], candidateSlugs: Set<string>): Evidence {
+  const traded = protocols.filter((p) => !recordsNoToken(p) && p.mcap_usd !== null && p.tvl_usd > 0);
+  const errs: number[] = [];
+  const pairs: { pred: number; actual: number }[] = [];
+  for (const fold of [0, 1]) {
+    const fit = categoryMultiples(traded.filter((p) => slugFold(p.slug) !== fold));
+    for (const p of traded) {
+      if (slugFold(p.slug) !== fold) continue;
+      // Fitted exactly as the board fits, but graded only against protocols
+      // carrying a market cap above zero — a recorded cap of $0 is a dead
+      // token, and no value model can be scored against it.
+      if (p.mcap_usd! <= 0) continue;
+      const pred = p.tvl_usd * multipleFor(fit, p.category).multiple;
+      errs.push(Math.abs(Math.log10(pred / p.mcap_usd!)));
+      pairs.push({ pred, actual: p.mcap_usd! });
+    }
+  }
+  errs.sort((a, b) => a - b);
+  const med = errs.length === 0 ? 0 : median(errs);
+  // Spearman rank correlation between the held-out predictions and the real
+  // market caps: the board is a ranking, so it is graded as one.
+  const spearman = (xs: { pred: number; actual: number }[]): number => {
+    if (xs.length < 3) return 0;
+    const ranks = (vals: number[]): number[] => {
+      const order = vals.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v || a.i - b.i);
+      const out = new Array<number>(vals.length);
+      let j = 0;
+      while (j < order.length) {
+        let k = j;
+        while (k + 1 < order.length && order[k + 1]!.v === order[j]!.v) k += 1;
+        const avg = (j + k) / 2 + 1;
+        for (let t = j; t <= k; t += 1) out[order[t]!.i] = avg;
+        j = k + 1;
+      }
+      return out;
+    };
+    const rp = ranks(xs.map((x) => x.pred));
+    const ra = ranks(xs.map((x) => x.actual));
+    const n = xs.length;
+    const mp = rp.reduce((s, x) => s + x, 0) / n;
+    const ma = ra.reduce((s, x) => s + x, 0) / n;
+    let cov = 0;
+    let vp = 0;
+    let va = 0;
+    for (let i = 0; i < n; i += 1) {
+      cov += (rp[i]! - mp) * (ra[i]! - ma);
+      vp += (rp[i]! - mp) ** 2;
+      va += (ra[i]! - ma) ** 2;
+    }
+    return vp === 0 || va === 0 ? 0 : roundTo(cov / Math.sqrt(vp * va), 2);
+  };
+  const within = (cap: number): number =>
+    errs.length === 0 ? 0 : roundTo((100 * errs.filter((e) => e <= Math.log10(cap)).length) / errs.length, 1);
+
+  const population = protocols.filter((p) => !recordsNoToken(p) || candidateSlugs.has(p.slug));
+  let brierModel = 0;
+  let brierNaive = 0;
+  let tested = 0;
+  for (const fold of [0, 1]) {
+    const fit = launchOddsTable(population.filter((p) => slugFold(p.slug) !== fold));
+    for (const p of population) {
+      if (slugFold(p.slug) !== fold) continue;
+      const y = recordsNoToken(p) ? 0 : 1;
+      const pm = oddsFor(fit, p.category).odds;
+      brierModel += (pm - y) ** 2;
+      brierNaive += (fit.global - y) ** 2;
+      tested += 1;
+    }
+  }
+  const bm = tested === 0 ? 0 : brierModel / tested;
+  const bn = tested === 0 ? 0 : brierNaive / tested;
+  return {
+    value_tested: errs.length,
+    value_median_factor: roundTo(10 ** med, 2),
+    value_within_2x: within(2),
+    value_within_3x: within(3),
+    value_spearman: spearman(pairs),
+    odds_tested: tested,
+    odds_brier_model: roundTo(bm, 3),
+    odds_brier_naive: roundTo(bn, 3),
+    odds_brier_gain: bn === 0 ? 0 : roundTo((100 * (bn - bm)) / bn, 1),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Board assembly and self-check.
 // ---------------------------------------------------------------------------
 
@@ -350,7 +537,7 @@ export function buildRadar(snapshot: Snapshot): { board: Row[]; radar: Radar } {
   const watch = new Set(snapshot.watchlist);
   let tokenless = 0;
   let excluded = 0;
-  const scored: RadarRow[] = [];
+  const candidates: Protocol[] = [];
   for (const p of snapshot.protocols) {
     if (!recordsNoToken(p)) continue;
     tokenless += 1;
@@ -358,15 +545,26 @@ export function buildRadar(snapshot: Snapshot): { board: Row[]; radar: Radar } {
       excluded += 1;
       continue;
     }
+    candidates.push(p);
+  }
+  const candidateSlugs = new Set(candidates.map((p) => p.slug));
+  const oddsTable = launchOddsTable(
+    snapshot.protocols.filter((p) => !recordsNoToken(p) || candidateSlugs.has(p.slug)),
+  );
+  const evidence = heldOutEvidence(snapshot.protocols, candidateSlugs);
+  const scored: RadarRow[] = [];
+  for (const p of candidates) {
     const mult = multipleFor(table, p.category);
     const age = ageYears(p, snapshot.as_of);
     const factors = factorsFor(p, age);
     const meta = farmMeta(p);
+    const implied = impliedValue(p, mult.multiple, factors);
+    const od = oddsFor(oddsTable, p.category);
     scored.push({
       slug: p.slug,
       name: p.name,
       rank: 0,
-      implied_value_usd: impliedValue(p, mult.multiple, factors),
+      implied_value_usd: implied,
       farm_steps: farmSteps(p),
       category: p.category,
       chains: p.chains,
@@ -378,6 +576,11 @@ export function buildRadar(snapshot: Snapshot): { board: Row[]; radar: Radar } {
       multiple: mult.multiple,
       multiple_n: mult.n,
       factors,
+      odds: roundTo(od.odds, 3),
+      odds_rate: roundTo(od.rate, 3),
+      odds_n: od.n,
+      odds_launched: od.launched,
+      expected_value_usd: Math.round(implied * od.odds),
       farm_cost: meta.cost,
       farm_time: meta.time,
     });
@@ -414,8 +617,10 @@ export function buildRadar(snapshot: Snapshot): { board: Row[]; radar: Radar } {
       watchlist: snapshot.watchlist.length,
       total_implied_usd: scored.reduce((s, r) => s + r.implied_value_usd, 0),
       global_multiple: table.global,
+      global_launch_rate: roundTo(oddsTable.global, 3),
     },
     multiples,
+    evidence,
     rows: scored,
   };
   return { board, radar };

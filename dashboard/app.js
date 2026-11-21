@@ -61,7 +61,7 @@
       '<div class="stat"><div class="k">Combined implied value</div><div class="v">' + compact(s.total_implied_usd) + '</div><div class="s">if every one launched today</div></div>' +
       '<div class="stat"><div class="k">Market multiple (median)</div><div class="v">' + s.global_multiple.toFixed(3) + '×</div><div class="s">market cap / TVL of traded protocols</div></div>' +
       '</div>' +
-      '<div class="method"><b>The model:</b> implied value <span class="fx">= TVL × category multiple × momentum × maturity × breadth × size dampener</span> — every input is a figure from the snapshot itself; open any protocol to see its arithmetic. <a href="#methodology">Full methodology below</a>.</div>'
+      '<div class="method"><b>The model:</b> implied value <span class="fx">= TVL × category multiple × momentum × maturity × breadth × size dampener</span> — every input is a figure from the snapshot itself; open any protocol to see its arithmetic. Each row also carries <b>launch odds</b> (its category’s launch base rate in this snapshot) and an <b>expected value</b> = implied × odds, and the model publishes its own held-out scores. <a href="#methodology">Full methodology below</a>.</div>'
     );
   }
 
@@ -92,6 +92,8 @@
     });
     var by = {
       rank: function (a, b) { return a.rank - b.rank; },
+      ev: function (a, b) { return b.expected_value_usd - a.expected_value_usd; },
+      odds: function (a, b) { return b.odds - a.odds; },
       tvl: function (a, b) { return b.tvl_usd - a.tvl_usd; },
       change: function (a, b) { return (b.change_7d || -1e9) - (a.change_7d || -1e9); },
       name: function (a, b) { return a.name < b.name ? -1 : 1; },
@@ -104,7 +106,7 @@
     var chainOpts = '<option value="">All chains</option>' + chains().map(function (c) {
       return '<option' + (c === chain ? ' selected' : '') + '>' + esc(c) + '</option>';
     }).join('');
-    var sortOpts = [['rank', 'Sort: implied value'], ['tvl', 'Sort: TVL'], ['change', 'Sort: 7-day change'], ['name', 'Sort: name']].map(function (o) {
+    var sortOpts = [['rank', 'Sort: implied value'], ['ev', 'Sort: expected value'], ['odds', 'Sort: launch odds'], ['tvl', 'Sort: TVL'], ['change', 'Sort: 7-day change'], ['name', 'Sort: name']].map(function (o) {
       return '<option value="' + o[0] + '"' + (o[0] === sort ? ' selected' : '') + '>' + o[1] + '</option>';
     }).join('');
 
@@ -120,7 +122,8 @@
         '<td class="num">' + compact(r.tvl_usd) + '</td>' +
         '<td>' + chg + '</td>' +
         '<td class="num implied">' + compact(r.implied_value_usd) + '</td>' +
-        '<td class="num">' + (r.implied_value_usd / r.tvl_usd).toFixed(2) + '×</td>' +
+        '<td class="num">' + Math.round(r.odds * 100) + '%</td>' +
+        '<td class="num ev">' + compact(r.expected_value_usd) + '</td>' +
         '<td class="farm"><b>' + esc(r.farm_cost) + '</b><br>' + esc(r.farm_time) + '</td></tr>';
     }).join('');
 
@@ -135,10 +138,10 @@
       '<table><thead><tr>' +
       '<th data-sort="rank">#</th><th data-sort="name">Protocol</th><th>Category</th><th>Chains</th>' +
       '<th class="num" data-sort="tvl">TVL</th><th class="num" data-sort="change">7d</th>' +
-      '<th class="num" data-sort="rank">Implied value</th><th class="num">Impl / TVL</th><th>Farm cost · time</th>' +
-      '</tr></thead><tbody>' + (body || '<tr><td colspan="9"><div class="empty">No protocol matches that filter.</div></td></tr>') + '</tbody></table>' +
+      '<th class="num" data-sort="rank">Implied value</th><th class="num" data-sort="odds">Odds</th><th class="num" data-sort="ev">Expected value</th><th>Farm cost · time</th>' +
+      '</tr></thead><tbody>' + (body || '<tr><td colspan="10"><div class="empty">No protocol matches that filter.</div></td></tr>') + '</tbody></table>' +
       methodology() +
-      '<footer>Data: ' + esc(R.source) + '. Implied values are this board’s own model output, not a prediction that any token will launch. Farm plans are starting points with typical costs — verify on the protocol’s official site and size to your own risk.</footer>';
+      '<footer>Data: ' + esc(R.source) + '. Implied values are this board’s own model output, not a prediction that any token will launch; launch odds are category base rates from this snapshot — history, not a promise. Farm plans are starting points with typical costs — verify on the protocol’s official site and size to your own risk.</footer>';
   }
 
   function methodology() {
@@ -152,6 +155,8 @@
       '<p><b>Category multiples used</b> (traded peers = n):</p>' +
       '<table class="mult"><thead><tr><th>Category</th><th class="num">Traded peers</th><th class="num">Multiple</th></tr></thead><tbody>' + mult +
       '<tr><td>All other categories</td><td class="num">—</td><td class="num">' + R.stats.global_multiple.toFixed(3) + '× market median</td></tr></tbody></table>' +
+      '<p><b>Launch odds.</b> A base rate, not a prophecy: among the independent protocols in a category — the ones already trading a token plus the candidates on this board — the share that has launched. Market-wide that share is ' + Math.round(R.stats.global_launch_rate * 100) + '%. Each category’s raw share is shrunk toward it with the same n/(n+4) weight as the multiples, so a two-protocol category cannot claim certainty the market does not support. <b>Expected value</b> = implied value × odds: what a launch is worth, weighted by how often launches in its category actually happen. Sort the board by it and the ranking changes — big-but-unlikely gives ground to likely.</p>' +
+      '<p><b>Evidence — the model grades itself.</b> The figures above are fitted on the whole snapshot; to test what that is worth, this program also re-fits both models twice on one half of the protocols (split by a hash of the slug) and predicts the other half, so every graded protocol was held out from its own fit. Value model: of the ' + R.evidence.value_tested + ' traded protocols carrying a market cap above zero, the median held-out prediction lands within ×' + R.evidence.value_median_factor + ' of the real market cap, ' + R.evidence.value_within_2x + '% land within 2×, and the ranking correlates with reality at Spearman ρ = ' + R.evidence.value_spearman.toFixed(2) + '. That scatter is the honest price of pricing from TVL alone — market caps also price narrative, float and timing, which no snapshot field carries — so it is published here rather than hidden. Odds model: across all ' + R.evidence.odds_tested + ' independent protocols, the category base rates score a Brier error of ' + R.evidence.odds_brier_model.toFixed(3) + ' against ' + R.evidence.odds_brier_naive.toFixed(3) + ' for quoting the market-wide rate for everyone — ' + R.evidence.odds_brier_gain + '% better calibrated, out of sample. Both scores are recomputed from the snapshot on every run; nothing here is a remembered number.</p>' +
       '<p><b>Farm plans.</b> Each row carries a five-step plan for its own category, filled with the protocol’s own chains, its scale tier and the gas its main chain actually costs — what to do, what it costs, and how long it takes. Costs are typical network fees, not protocol guarantees.</p></section>';
   }
 
@@ -189,6 +194,11 @@
       '<div class="factor"><span class="fname">× Size dampener<small>' + (f.dampener < 1 ? 'TVL above $1B — the multiple compresses' : 'TVL below $1B — no compression') + '</small></span><span class="fval">' + fx(f.dampener) + '</span></div>' +
       '<div class="total"><span>Implied launch value</span><span class="v">' + usd(r.implied_value_usd) + '</span></div>' +
       '</div></div>' +
+      '<section class="block"><h2>Launch odds & expected value</h2>' +
+      '<div class="factor"><span class="fname">Category launch record<small>' + r.odds_launched + ' of ' + r.odds_n + ' independent ' + esc(r.category || 'Uncategorized') + ' protocols in this snapshot already trade a token</small></span><span class="fval">' + Math.round(r.odds_rate * 100) + '%</span></div>' +
+      '<div class="factor"><span class="fname">Shrunk toward the market<small>market-wide launch rate ' + Math.round(R.stats.global_launch_rate * 100) + '%, weight n/(n+4) — small categories borrow the market’s evidence</small></span><span class="fval">' + Math.round(r.odds * 100) + '%</span></div>' +
+      '<div class="total"><span>Expected value (implied × odds)</span><span class="v">' + usd(r.expected_value_usd) + '</span></div>' +
+      '<p>Odds are a base rate from one snapshot: how often protocols in this category have launched, not whether this one will. A protocol can also stay tokenless by choice — the rate cannot see intent.</p></section>' +
       '<section class="block"><h2>Farm plan — ' + esc(r.name) + '</h2>' +
       '<div class="chips"><span class="chip">Cost <b>' + esc(r.farm_cost) + '</b></span><span class="chip">Time <b>' + esc(r.farm_time) + '</b></span><span class="chip">Category <b>' + esc(r.category || 'Uncategorized') + '</b></span></div>' +
       '<ol class="steps">' + steps + '</ol>' +

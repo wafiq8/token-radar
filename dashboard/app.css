@@ -106,6 +106,7 @@ tr.top .rank { color: var(--mint); }
 .chains { color: var(--dim); font-size: 13.5px; }
 .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .implied { font-weight: 700; color: var(--mint); }
+.ev { font-weight: 600; }
 .pos { color: var(--mint); }
 .neg { color: var(--red); }
 .farm { color: var(--dim); font-size: 13px; white-space: nowrap; }
